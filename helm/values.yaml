@@ -1,0 +1,128 @@
+# Default values for sandbox-api.
+#
+# image.tag is rewritten by CI at package time so the published chart version
+# and its image are one artifact. Nothing downstream sets image.tag: a
+# deployment pins the CHART version and gets a coherent chart+image.
+
+fullnameOverride: sandbox-api
+
+replicaCount: 2
+
+image:
+  repository: ghcr.io/kanzalqalandri/sandbox-api
+  tag: latest
+  pullPolicy: IfNotPresent
+
+container:
+  imagePullSecrets: []
+
+service:
+  type: ClusterIP
+  port: 5000
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations: {}
+  path: /api
+  extra_paths: []
+  hostname: sandbox.example.com
+  tlsSecretName: ""
+
+readinessProbe:
+  httpGet:
+    path: /api/health-check/readiness
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+livenessProbe:
+  httpGet:
+    path: /api/health-check/liveness
+    port: http
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+deployment:
+  annotations: {}
+  template:
+    labels: {}
+
+deploymentStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+
+# Where this component sits. Rendered into platform-config/values.yaml by the CD
+# pipeline from instance.yaml + clusters.yaml, and surfaced by the app at /version
+# so a deploy can be confirmed from outside the cluster.
+placement:
+  stack: ""
+  instance: ""
+  cluster: ""
+  environment: ""
+
+# Non-secret configuration. Values are run through `tpl` so they may reference
+# other values, matching the tenant-api convention.
+envVars:
+  - name: "URL_PREFIX"
+    value: "{{ .Values.ingress.path }}"
+  - name: "APP_VERSION"
+    value: "{{ .Chart.Version }}"
+  - name: "STACK"
+    value: "{{ .Values.placement.stack }}"
+  - name: "INSTANCE"
+    value: "{{ .Values.placement.instance }}"
+  - name: "CLUSTER"
+    value: "{{ .Values.placement.cluster }}"
+  - name: "ENVIRONMENT"
+    value: "{{ .Values.placement.environment }}"
+
+# Test hooks for the CD health gate. Set failReadiness=true through a deploy to
+# make readiness fail on purpose and watch auto-rollback happen.
+failReadiness: false
+startupDelayMs: 0
+
+# --- secrets ------------------------------------------------------------------
+# Secrets are pulled from OpenBao by External Secrets Operator at runtime. This
+# chart never renders a Secret from values, so no secret material can reach git
+# even by accident. The platform supplies exactly one thing: `path`.
+#
+# The app team owns this list — which keys it needs is an application concern.
+externalSecret:
+  enabled: false
+  secretStoreName: openbao
+  secretStoreKind: ClusterSecretStore
+  refreshInterval: 1h
+  path: ""              # e.g. secret/tenants/dev/us-dev-01/acme/sandbox-api
+  keys:
+    - DEMO_API_KEY
+    - DEMO_DB_URI
+
+resources:
+  limits:
+    memory: "128Mi"
+    cpu: "200m"
+  requests:
+    memory: "64Mi"
+    cpu: "10m"
+
+nodeSelector: {}
+tolerations: []
+
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - sandbox-api
+          topologyKey: kubernetes.io/hostname

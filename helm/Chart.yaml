@@ -1,0 +1,6 @@
+apiVersion: v2
+name: sandbox-api
+description: Stand-in API component for the Apporto Platform v2 sandbox
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

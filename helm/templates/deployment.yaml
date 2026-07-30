@@ -1,0 +1,85 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ template "sandbox-api.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{ include "sandbox-api.labels" . | indent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+{{- with .Values.deploymentStrategy }}
+  strategy:
+{{ toYaml . | indent 4 }}
+{{- end }}
+  selector:
+    matchLabels:
+      app: {{ template "sandbox-api.name" . }}
+      release: {{ .Release.Name }}
+  template:
+    metadata:
+{{- with .Values.deployment.annotations }}
+      annotations:
+{{ toYaml . | indent 8 }}
+{{- end }}
+      labels:
+        app: {{ template "sandbox-api.name" . }}
+        release: {{ .Release.Name }}
+{{- with .Values.deployment.template.labels }}
+{{ toYaml . | indent 8 }}
+{{- end }}
+    spec:
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+{{- range .Values.envVars }}
+            - name: {{ .name | quote }}
+              value: {{ tpl .value $ | quote }}
+{{- end }}
+            - name: "FAIL_READINESS"
+              value: {{ .Values.failReadiness | quote }}
+            - name: "STARTUP_DELAY_MS"
+              value: {{ .Values.startupDelayMs | quote }}
+{{- if .Values.externalSecret.enabled }}
+          # Secrets are projected from the ExternalSecret, never from values.
+          envFrom:
+            - secretRef:
+                name: {{ include "sandbox-api.fullname" . }}-env
+{{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+{{- with .Values.readinessProbe }}
+          readinessProbe:
+{{ toYaml . | indent 12 }}
+{{- end }}
+{{- with .Values.livenessProbe }}
+          livenessProbe:
+{{ toYaml . | indent 12 }}
+{{- end }}
+          resources:
+{{ toYaml .Values.resources | indent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+{{- with .Values.nodeSelector }}
+      nodeSelector:
+{{ toYaml . | indent 8 }}
+{{- end }}
+{{- with .Values.affinity }}
+      affinity:
+{{ toYaml . | indent 8 }}
+{{- end }}
+{{- with .Values.tolerations }}
+      tolerations:
+{{ toYaml . | indent 8 }}
+{{- end }}
+{{- with .Values.container.imagePullSecrets }}
+      imagePullSecrets:
+{{ toYaml . | indent 8 }}
+{{- end }}

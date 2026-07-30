@@ -1,0 +1,11 @@
+sandbox-api {{ .Chart.Version }} deployed to namespace {{ .Release.Namespace }}.
+
+  stack/instance : {{ .Values.placement.stack | default "?" }}/{{ .Values.placement.instance | default "?" }}
+  cluster / env  : {{ .Values.placement.cluster | default "?" }} / {{ .Values.placement.environment | default "?" }}
+  image          : {{ .Values.image.repository }}:{{ .Values.image.tag }}
+  secrets        : {{ if .Values.externalSecret.enabled }}ESO from {{ .Values.externalSecret.path }}{{ else }}disabled{{ end }}
+
+Confirm what is actually running:
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ template "sandbox-api.fullname" . }} 8080:{{ .Values.service.port }}
+  curl -s localhost:8080/version

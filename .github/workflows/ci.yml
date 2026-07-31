@@ -1,0 +1,113 @@
+name: CI
+
+# Dev-owned. Change this freely — CD mechanics live in platform-workflows and are
+# not affected by anything here.
+#
+# Publishes two artifacts and ONE version string:
+#   image → ghcr.io/<owner>/sandbox-api:<tag>
+#   chart → oci://ghcr.io/<owner>/charts/sandbox-api:<version>
+#
+# The image tag is baked into the chart's values.yaml before packaging, so a
+# deployment pins the CHART version and gets a coherent chart+image. Nothing
+# downstream ever sets image.tag — that is what makes promotion "move the same
+# string to the next environment" and rollback "move it back".
+#
+#   tag v1.2.3  -> image 1.2.3            chart 1.2.3           (releasable)
+#   main        -> image main-<sha8>      chart 0.<ts>-main-<sha8>
+
+on:
+  push:
+    tags: ['v[0-9]*.[0-9]*.[0-9]*']
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  COMPONENT: sandbox-api
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_tag: ${{ steps.id.outputs.image_tag }}
+      chart_version: ${{ steps.id.outputs.chart_version }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Compute the version string
+        id: id
+        run: |
+          set -euo pipefail
+          SHA8="${GITHUB_SHA::8}"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            IMAGE_TAG="${GITHUB_REF_NAME#v}"
+            CHART_VERSION="${IMAGE_TAG}"
+          else
+            SLUG="${GITHUB_REF_NAME//\//-}"
+            IMAGE_TAG="${SLUG}-${SHA8}"
+            CHART_VERSION="0.$(date -u +%Y%m%d).$(date -u +%H%M%S)-${SLUG}-${SHA8}"
+          fi
+          echo "image_tag=${IMAGE_TAG}"         | tee -a "$GITHUB_OUTPUT"
+          echo "chart_version=${CHART_VERSION}" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Log in to the registry
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login "$REGISTRY" -u "${{ github.actor }}" --password-stdin
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | helm registry login "$REGISTRY" -u "${{ github.actor }}" --password-stdin
+
+      - name: Build and push the image
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.COMPONENT }}
+        run: |
+          set -euo pipefail
+          docker build -t "${IMAGE}:${{ steps.id.outputs.image_tag }}" .
+          docker push "${IMAGE}:${{ steps.id.outputs.image_tag }}"
+
+      - name: Bake the image tag into the chart, then package and push it
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.COMPONENT }}
+          CHART_VERSION: ${{ steps.id.outputs.chart_version }}
+          IMAGE_TAG: ${{ steps.id.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          # The one write that makes chart and image a single artifact.
+          yq -i ".image.repository = \"${IMAGE}\" | .image.tag = \"${IMAGE_TAG}\"" helm/values.yaml
+          helm lint helm
+          helm package helm --version "${CHART_VERSION}" --app-version "${IMAGE_TAG}"
+          helm push "${COMPONENT}-${CHART_VERSION}.tgz" \
+            "oci://${REGISTRY}/${{ github.repository_owner }}/charts"
+
+      - name: Prove the published chart carries the matching image
+        env:
+          CHART_VERSION: ${{ steps.id.outputs.chart_version }}
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/pull && mkdir -p /tmp/pull
+          helm pull "oci://${REGISTRY}/${{ github.repository_owner }}/charts/${COMPONENT}" \
+            --version "${CHART_VERSION}" -d /tmp/pull --untar
+          BAKED=$(yq -r '.image.repository + ":" + .image.tag' "/tmp/pull/${COMPONENT}/values.yaml")
+          echo "chart ${CHART_VERSION} deploys ${BAKED}"
+          [ "${BAKED}" = "${REGISTRY}/${{ github.repository_owner }}/${COMPONENT}:${{ steps.id.outputs.image_tag }}" ]
+
+      - name: Summary
+        run: |
+          {
+            echo "### Published"
+            echo
+            echo "| artifact | reference |"
+            echo "|---|---|"
+            echo "| image | \`${REGISTRY}/${{ github.repository_owner }}/${COMPONENT}:${{ steps.id.outputs.image_tag }}\` |"
+            echo "| chart | \`oci://${REGISTRY}/${{ github.repository_owner }}/charts/${COMPONENT}:${{ steps.id.outputs.chart_version }}\` |"
+            echo
+            echo "Deploy it:"
+            echo '```'
+            echo "gh workflow run instance-create.yml -R ${{ github.repository_owner }}/platform-workflows \\"
+            echo "  -f stack=tenants -f instance=<tenant> -f cluster=<cluster> \\"
+            echo "  -f versions=${COMPONENT}=${{ steps.id.outputs.chart_version }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

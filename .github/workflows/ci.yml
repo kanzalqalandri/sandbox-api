@@ -3,9 +3,20 @@ name: CI
 # Dev-owned. Change this freely — CD mechanics live in platform-workflows and are
 # not affected by anything here.
 #
-# Publishes two artifacts and ONE version string:
-#   image → ghcr.io/<owner>/sandbox-api:<tag>
-#   chart → oci://ghcr.io/<owner>/charts/sandbox-api:<version>
+# Publishes two artifacts and ONE version string, both to Docker Hub:
+#   image → docker.io/<ns>/sandbox-api:<tag>
+#   chart → oci://docker.io/<ns>/charts/sandbox-api:<version>
+#
+# Docker Hub rather than GHCR because GHCR package visibility cannot be set via
+# API, and a private package means the cluster needs a registry credential. Public
+# Docker Hub images and charts need none. Production uses Harbor, which is
+# authenticated — so this is a sandbox convenience, not the target shape.
+#
+# Requires, on this repo:
+#   variable DOCKERHUB_NAMESPACE  (your Docker Hub user/org — not secret, it is
+#                                  part of every image reference and must appear
+#                                  in logs unmasked)
+#   secret   DOCKERHUB_TOKEN      (access token with Read & Write)
 #
 # The image tag is baked into the chart's values.yaml before packaging, so a
 # deployment pins the CHART version and gets a coherent chart+image. Nothing
@@ -22,7 +33,8 @@ on:
   workflow_dispatch:
 
 env:
-  REGISTRY: ghcr.io
+  REGISTRY: docker.io
+  NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
   COMPONENT: sandbox-api
 
 jobs:
@@ -53,16 +65,27 @@ jobs:
           echo "image_tag=${IMAGE_TAG}"         | tee -a "$GITHUB_OUTPUT"
           echo "chart_version=${CHART_VERSION}" | tee -a "$GITHUB_OUTPUT"
 
+      - name: Check the registry is configured
+        run: |
+          if [ -z "${NAMESPACE}" ]; then
+            echo "::error::repository variable DOCKERHUB_NAMESPACE is not set."
+            exit 1
+          fi
+          if [ -z "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
+            echo "::error::repository secret DOCKERHUB_TOKEN is not set."
+            exit 1
+          fi
+
       - name: Log in to the registry
         run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" \
-            | docker login "$REGISTRY" -u "${{ github.actor }}" --password-stdin
-          echo "${{ secrets.GITHUB_TOKEN }}" \
-            | helm registry login "$REGISTRY" -u "${{ github.actor }}" --password-stdin
+          echo "${{ secrets.DOCKERHUB_TOKEN }}" \
+            | docker login "$REGISTRY" -u "$NAMESPACE" --password-stdin
+          echo "${{ secrets.DOCKERHUB_TOKEN }}" \
+            | helm registry login "$REGISTRY" -u "$NAMESPACE" --password-stdin
 
       - name: Build and push the image
         env:
-          IMAGE: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.COMPONENT }}
+          IMAGE: ${{ env.REGISTRY }}/${{ vars.DOCKERHUB_NAMESPACE }}/${{ env.COMPONENT }}
         run: |
           set -euo pipefail
           docker build -t "${IMAGE}:${{ steps.id.outputs.image_tag }}" .
@@ -70,7 +93,7 @@ jobs:
 
       - name: Bake the image tag into the chart, then package and push it
         env:
-          IMAGE: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.COMPONENT }}
+          IMAGE: ${{ env.REGISTRY }}/${{ vars.DOCKERHUB_NAMESPACE }}/${{ env.COMPONENT }}
           CHART_VERSION: ${{ steps.id.outputs.chart_version }}
           IMAGE_TAG: ${{ steps.id.outputs.image_tag }}
         run: |
@@ -80,7 +103,7 @@ jobs:
           helm lint helm
           helm package helm --version "${CHART_VERSION}" --app-version "${IMAGE_TAG}"
           helm push "${COMPONENT}-${CHART_VERSION}.tgz" \
-            "oci://${REGISTRY}/${{ github.repository_owner }}/charts"
+            "oci://${REGISTRY}/${NAMESPACE}/charts"
 
       - name: Prove the published chart carries the matching image
         env:
@@ -88,11 +111,11 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf /tmp/pull && mkdir -p /tmp/pull
-          helm pull "oci://${REGISTRY}/${{ github.repository_owner }}/charts/${COMPONENT}" \
+          helm pull "oci://${REGISTRY}/${NAMESPACE}/charts/${COMPONENT}" \
             --version "${CHART_VERSION}" -d /tmp/pull --untar
           BAKED=$(yq -r '.image.repository + ":" + .image.tag' "/tmp/pull/${COMPONENT}/values.yaml")
           echo "chart ${CHART_VERSION} deploys ${BAKED}"
-          [ "${BAKED}" = "${REGISTRY}/${{ github.repository_owner }}/${COMPONENT}:${{ steps.id.outputs.image_tag }}" ]
+          [ "${BAKED}" = "${REGISTRY}/${NAMESPACE}/${COMPONENT}:${{ steps.id.outputs.image_tag }}" ]
 
       - name: Summary
         run: |
@@ -101,8 +124,8 @@ jobs:
             echo
             echo "| artifact | reference |"
             echo "|---|---|"
-            echo "| image | \`${REGISTRY}/${{ github.repository_owner }}/${COMPONENT}:${{ steps.id.outputs.image_tag }}\` |"
-            echo "| chart | \`oci://${REGISTRY}/${{ github.repository_owner }}/charts/${COMPONENT}:${{ steps.id.outputs.chart_version }}\` |"
+            echo "| image | \`${REGISTRY}/${NAMESPACE}/${COMPONENT}:${{ steps.id.outputs.image_tag }}\` |"
+            echo "| chart | \`oci://${REGISTRY}/${NAMESPACE}/charts/${COMPONENT}:${{ steps.id.outputs.chart_version }}\` |"
             echo
             echo "Deploy it:"
             echo '```'

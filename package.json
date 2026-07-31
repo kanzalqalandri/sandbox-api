@@ -1,11 +1,13 @@
 {
   "name": "sandbox-api",
-  "version": "0.2.0",
+  "version": "1.0.3",
   "private": true,
   "description": "Stand-in API component for Apporto Platform v2 sandbox",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js"
   },
-  "engines": { "node": ">=22" }
+  "engines": {
+    "node": ">=22"
+  }
 }

@@ -65,6 +65,10 @@ spec:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             runAsNonRoot: true
+            # Numeric, not the `node` name from the Dockerfile: kubelet refuses a
+            # runAsNonRoot container whose image user it cannot prove is non-root.
+            runAsUser: 1000
+            runAsGroup: 1000
             capabilities:
               drop: ["ALL"]
 {{- with .Values.nodeSelector }}

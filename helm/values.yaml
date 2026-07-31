@@ -9,7 +9,7 @@ fullnameOverride: sandbox-api
 replicaCount: 2
 
 image:
-  repository: ghcr.io/kanzalqalandri/sandbox-api
+  repository: docker.io/kanzal/sandbox-api
   tag: latest
   pullPolicy: IfNotPresent
 

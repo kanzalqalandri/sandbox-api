@@ -3,14 +3,19 @@ name: CI
 # Dev-owned. Change this freely — CD mechanics live in platform-workflows and are
 # not affected by anything here.
 #
-# Publishes two artifacts and ONE version string, both to Docker Hub:
-#   image → docker.io/<ns>/sandbox-api:<tag>
-#   chart → oci://docker.io/<ns>/charts/sandbox-api:<version>
+# Publishes ONE artifact and ONE version string:
+#   image → docker.io/<ns>/sandbox-api:<version>
 #
-# Docker Hub rather than GHCR because GHCR package visibility cannot be set via
-# API, and a private package means the cluster needs a registry credential. Public
-# Docker Hub images and charts need none. Production uses Harbor, which is
-# authenticated — so this is a sandbox convenience, not the target shape.
+# The CHART is not published to a registry: ArgoCD reads it straight from this
+# repo at the git tag, so `v<version>` is simultaneously the chart reference and
+# the image tag. One string still moves both — which is what keeps rollback from
+# producing an old image against a new chart.
+#
+# The tag must therefore never be moved once pushed. A moved tag silently changes
+# the chart under a version that is already deployed, with no commit anywhere to
+# show it. In production this is why the chart is a published OCI artifact (as
+# tenant-api already does) rather than a git ref: a registry digest cannot be
+# rewritten, a git tag can.
 #
 # Requires, on this repo:
 #   variable DOCKERHUB_NAMESPACE  (your Docker Hub user/org — not secret, it is
@@ -23,8 +28,8 @@ name: CI
 # downstream ever sets image.tag — that is what makes promotion "move the same
 # string to the next environment" and rollback "move it back".
 #
-#   tag v1.2.3  -> image 1.2.3            chart 1.2.3           (releasable)
-#   main        -> image main-<sha8>      chart 0.<ts>-main-<sha8>
+#   tag v1.2.3  -> image 1.2.3, chart read from git tag v1.2.3  (releasable)
+#   main        -> image main-<sha8>, chart read from that commit
 
 on:
   push:
@@ -45,7 +50,7 @@ jobs:
       packages: write
     outputs:
       image_tag: ${{ steps.id.outputs.image_tag }}
-      chart_version: ${{ steps.id.outputs.chart_version }}
+      chart_ref: ${{ steps.id.outputs.chart_ref }}
     steps:
       - uses: actions/checkout@v5
 
@@ -56,14 +61,14 @@ jobs:
           SHA8="${GITHUB_SHA::8}"
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             IMAGE_TAG="${GITHUB_REF_NAME#v}"
-            CHART_VERSION="${IMAGE_TAG}"
+            CHART_REF="${GITHUB_REF_NAME}"
           else
             SLUG="${GITHUB_REF_NAME//\//-}"
             IMAGE_TAG="${SLUG}-${SHA8}"
-            CHART_VERSION="0.$(date -u +%Y%m%d).$(date -u +%H%M%S)-${SLUG}-${SHA8}"
+            CHART_REF="${GITHUB_SHA}"
           fi
-          echo "image_tag=${IMAGE_TAG}"         | tee -a "$GITHUB_OUTPUT"
-          echo "chart_version=${CHART_VERSION}" | tee -a "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}" | tee -a "$GITHUB_OUTPUT"
+          echo "chart_ref=${CHART_REF}"  | tee -a "$GITHUB_OUTPUT"
 
       - name: Check the registry is configured
         run: |
@@ -80,8 +85,6 @@ jobs:
         run: |
           echo "${{ secrets.DOCKERHUB_TOKEN }}" \
             | docker login "$REGISTRY" -u "$NAMESPACE" --password-stdin
-          echo "${{ secrets.DOCKERHUB_TOKEN }}" \
-            | helm registry login "$REGISTRY" -u "$NAMESPACE" --password-stdin
 
       - name: Build and push the image
         env:
@@ -91,31 +94,24 @@ jobs:
           docker build -t "${IMAGE}:${{ steps.id.outputs.image_tag }}" .
           docker push "${IMAGE}:${{ steps.id.outputs.image_tag }}"
 
-      - name: Bake the image tag into the chart, then package and push it
-        env:
-          IMAGE: ${{ env.REGISTRY }}/${{ vars.DOCKERHUB_NAMESPACE }}/${{ env.COMPONENT }}
-          CHART_VERSION: ${{ steps.id.outputs.chart_version }}
-          IMAGE_TAG: ${{ steps.id.outputs.image_tag }}
+      - name: Validate the chart that ArgoCD will read from this ref
         run: |
           set -euo pipefail
-          # The one write that makes chart and image a single artifact.
-          yq -i ".image.repository = \"${IMAGE}\" | .image.tag = \"${IMAGE_TAG}\"" helm/values.yaml
+          # ArgoCD renders helm/ straight from this commit, so a chart that does
+          # not template here is a chart that will not deploy. Fail now, not in a
+          # ComparisonError twenty minutes later.
           helm lint helm
-          helm package helm --version "${CHART_VERSION}" --app-version "${IMAGE_TAG}"
-          helm push "${COMPONENT}-${CHART_VERSION}.tgz" \
-            "oci://${REGISTRY}/${NAMESPACE}/charts"
+          helm template "$COMPONENT" helm --set image.tag="${{ steps.id.outputs.image_tag }}" >/dev/null
 
-      - name: Prove the published chart carries the matching image
-        env:
-          CHART_VERSION: ${{ steps.id.outputs.chart_version }}
-        run: |
-          set -euo pipefail
-          rm -rf /tmp/pull && mkdir -p /tmp/pull
-          helm pull "oci://${REGISTRY}/${NAMESPACE}/charts/${COMPONENT}" \
-            --version "${CHART_VERSION}" -d /tmp/pull --untar
-          BAKED=$(yq -r '.image.repository + ":" + .image.tag' "/tmp/pull/${COMPONENT}/values.yaml")
-          echo "chart ${CHART_VERSION} deploys ${BAKED}"
-          [ "${BAKED}" = "${REGISTRY}/${NAMESPACE}/${COMPONENT}:${{ steps.id.outputs.image_tag }}" ]
+          # The chart's committed image.repository must match where CI actually
+          # pushed, or the platform would set a tag on the wrong image.
+          WANT="${REGISTRY}/${NAMESPACE}/${COMPONENT}"
+          GOT=$(yq -r '.image.repository' helm/values.yaml)
+          if [ "$GOT" != "$WANT" ]; then
+            echo "::error file=helm/values.yaml::image.repository is '$GOT', expected '$WANT'"
+            exit 1
+          fi
+          echo "chart at ${{ steps.id.outputs.chart_ref }} deploys ${WANT}:${{ steps.id.outputs.image_tag }}"
 
       - name: Summary
         run: |
@@ -125,12 +121,12 @@ jobs:
             echo "| artifact | reference |"
             echo "|---|---|"
             echo "| image | \`${REGISTRY}/${NAMESPACE}/${COMPONENT}:${{ steps.id.outputs.image_tag }}\` |"
-            echo "| chart | \`oci://${REGISTRY}/${NAMESPACE}/charts/${COMPONENT}:${{ steps.id.outputs.chart_version }}\` |"
+            echo "| chart | \`${{ github.repository }}//helm @ ${{ steps.id.outputs.chart_ref }}\` |"
             echo
             echo "Deploy it:"
             echo '```'
             echo "gh workflow run instance-create.yml -R ${{ github.repository_owner }}/platform-workflows \\"
             echo "  -f stack=tenants -f instance=<tenant> -f cluster=<cluster> \\"
-            echo "  -f versions=${COMPONENT}=${{ steps.id.outputs.chart_version }}"
+            echo "  -f versions=${COMPONENT}=${{ steps.id.outputs.image_tag }}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

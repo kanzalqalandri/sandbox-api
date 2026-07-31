@@ -72,7 +72,10 @@ envVars:
   - name: "URL_PREFIX"
     value: "{{ .Values.ingress.path }}"
   - name: "APP_VERSION"
-    value: "{{ .Chart.Version }}"
+    # image.tag, not .Chart.Version: ArgoCD reads this chart from a git tag, so
+    # Chart.yaml's version no longer tracks what is deployed. image.tag is set by
+    # the platform from the one version string, so it always does.
+    value: "{{ .Values.image.tag }}"
   - name: "STACK"
     value: "{{ .Values.placement.stack }}"
   - name: "INSTANCE"

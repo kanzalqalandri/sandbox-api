@@ -85,6 +85,11 @@ envVars:
   - name: "ENVIRONMENT"
     value: "{{ .Values.placement.environment }}"
 
+# Per-tenant environment, written by the platform from release.yaml. Never
+# secrets: those come from OpenBao via ESO, and the CD preflight blocks anything
+# secret-shaped from reaching a rendered values file.
+extraEnv: {}
+
 # Test hooks for the CD health gate. Set failReadiness=true through a deploy to
 # make readiness fail on purpose and watch auto-rollback happen.
 failReadiness: false

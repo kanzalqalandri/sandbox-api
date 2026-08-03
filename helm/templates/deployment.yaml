@@ -41,6 +41,13 @@ spec:
               value: {{ .Values.failReadiness | quote }}
             - name: "STARTUP_DELAY_MS"
               value: {{ .Values.startupDelayMs | quote }}
+{{- /* Per-tenant env, set by the platform from release.yaml. A MAP, not a list,
+       so the platform can add or remove one key without restating the chart's own
+       env — Helm replaces lists wholesale. */}}
+{{- range $k, $v := .Values.extraEnv }}
+            - name: {{ $k | quote }}
+              value: {{ $v | quote }}
+{{- end }}
 {{- if .Values.externalSecret.enabled }}
           # Secrets are projected from the ExternalSecret, never from values.
           envFrom:

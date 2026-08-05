@@ -22,19 +22,32 @@ name: CI
 #                                  part of every image reference and must appear
 #                                  in logs unmasked)
 #   secret   DOCKERHUB_TOKEN      (access token with Read & Write)
+#   variable DEV_CLUSTER          (the one dev cluster dev/*/** deploys pushed to)
+#   secret   DISPATCH_TOKEN       (actions:write on kanzalqalandri/platform-workflows
+#                                  only — dispatches the dev-branch deploy below)
 #
 # The image tag is baked into the chart's values.yaml before packaging, so a
 # deployment pins the CHART version and gets a coherent chart+image. Nothing
 # downstream ever sets image.tag — that is what makes promotion "move the same
 # string to the next environment" and rollback "move it back".
 #
-#   tag v1.2.3  -> image 1.2.3, chart read from git tag v1.2.3  (releasable)
-#   main        -> image main-<sha8>, chart read from that commit
+#   tag v1.2.3    -> image 1.2.3, chart read from git tag v1.2.3       (releasable)
+#   dev/<id>/*    -> image = full commit SHA = chart ref, SAME string — see below
+#   main          -> image main-<sha8>, chart read from that commit
+#
+# dev/<tenant-id>/<whatever> is the whole self-service dev loop: create the tenant
+# ONCE with tenant-create.yml, then every push here updates ONLY this component of
+# that tenant. Nobody runs a workflow by hand again. The image tag on a dev branch
+# is the raw commit SHA rather than the usual <slug>-<sha8> — deliberately: it must
+# be the exact same string as the chart ref (git can't clone --branch a bare SHA,
+# but it CAN fetch one directly, which is what platform-workflows' preflight does),
+# or we reintroduce the two-strings-for-one-artifact problem this design removed
+# everywhere else. The Docker Hub tag reads worse; that's the trade.
 
 on:
   push:
     tags: ['v[0-9]*.[0-9]*.[0-9]*']
-    branches: [main]
+    branches: [main, 'dev/*/**']
   workflow_dispatch:
 
 env:
@@ -62,6 +75,10 @@ jobs:
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             IMAGE_TAG="${GITHUB_REF_NAME#v}"
             CHART_REF="${GITHUB_REF_NAME}"
+          elif [[ "${GITHUB_REF_NAME}" == dev/*/* ]]; then
+            # One string for both, always — see the header note on why.
+            IMAGE_TAG="${GITHUB_SHA}"
+            CHART_REF="${GITHUB_SHA}"
           else
             SLUG="${GITHUB_REF_NAME//\//-}"
             IMAGE_TAG="${SLUG}-${SHA8}"
@@ -69,6 +86,18 @@ jobs:
           fi
           echo "image_tag=${IMAGE_TAG}" | tee -a "$GITHUB_OUTPUT"
           echo "chart_ref=${CHART_REF}"  | tee -a "$GITHUB_OUTPUT"
+
+      - name: Parse the dev tenant from the branch name
+        id: dev
+        if: ${{ startsWith(github.ref_name, 'dev/') }}
+        run: |
+          set -euo pipefail
+          IFS='/' read -ra PARTS <<< "${GITHUB_REF_NAME}"
+          if [ "${#PARTS[@]}" -lt 3 ] || [ -z "${PARTS[1]}" ]; then
+            echo "::error::branch '${GITHUB_REF_NAME}' does not match dev/<tenant-id>/<whatever>"
+            exit 1
+          fi
+          echo "tenant=dev-${PARTS[1]}" | tee -a "$GITHUB_OUTPUT"
 
       - name: Check the registry is configured
         run: |
@@ -113,6 +142,30 @@ jobs:
           fi
           echo "chart at ${{ steps.id.outputs.chart_ref }} deploys ${WANT}:${{ steps.id.outputs.image_tag }}"
 
+      - name: Deploy to the dev tenant
+        # The whole point: nobody runs a workflow by hand after tenant-create.
+        # This only ever UPDATES an existing tenant — tenant-component-version.yml
+        # refuses on one that does not exist, by design, so a typo'd tenant id
+        # fails loudly here instead of silently creating a stray tenant.
+        if: ${{ startsWith(github.ref_name, 'dev/') }}
+        env:
+          GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::error::repository secret DISPATCH_TOKEN is not set (needs actions:write on kanzalqalandri/platform-workflows only)."
+            exit 1
+          fi
+          if [ -z "${{ vars.DEV_CLUSTER }}" ]; then
+            echo "::error::repository variable DEV_CLUSTER is not set."
+            exit 1
+          fi
+          gh workflow run tenant-component-version.yml -R kanzalqalandri/platform-workflows \
+            -f instance="${{ steps.dev.outputs.tenant }}" \
+            -f cluster="${{ vars.DEV_CLUSTER }}" \
+            -f component="${COMPONENT}" \
+            -f version="${{ steps.id.outputs.image_tag }}"
+
       - name: Summary
         run: |
           {
@@ -123,10 +176,13 @@ jobs:
             echo "| image | \`${REGISTRY}/${NAMESPACE}/${COMPONENT}:${{ steps.id.outputs.image_tag }}\` |"
             echo "| chart | \`${{ github.repository }}//helm @ ${{ steps.id.outputs.chart_ref }}\` |"
             echo
-            echo "Deploy it:"
-            echo '```'
-            echo "gh workflow run instance-create.yml -R ${{ github.repository_owner }}/platform-workflows \\"
-            echo "  -f stack=tenants -f instance=<tenant> -f cluster=<cluster> \\"
-            echo "  -f versions=${COMPONENT}=${{ steps.id.outputs.image_tag }}"
-            echo '```'
+            if [ -n "${{ steps.dev.outputs.tenant }}" ]; then
+              echo "Deployed to \`${{ steps.dev.outputs.tenant }}\` on \`${{ vars.DEV_CLUSTER }}\` automatically."
+            else
+              echo "Deploy it:"
+              echo '```'
+              echo "gh workflow run tenant-version.yml -R ${{ github.repository_owner }}/platform-workflows \\"
+              echo "  -f instance=<tenant> -f cluster=<cluster> -f version=${{ steps.id.outputs.image_tag }}"
+              echo '```'
+            fi
           } >> "$GITHUB_STEP_SUMMARY"

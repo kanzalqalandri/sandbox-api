@@ -3,19 +3,25 @@ name: CI
 # Dev-owned. Change this freely — CD mechanics live in platform-workflows and are
 # not affected by anything here.
 #
-# Publishes ONE artifact and ONE version string:
+# Publishes ONE artifact and ONE version string for a RELEASE:
 #   image → docker.io/<ns>/sandbox-api:<version>
 #
 # The CHART is not published to a registry: ArgoCD reads it straight from this
-# repo at the git tag, so `v<version>` is simultaneously the chart reference and
-# the image tag. One string still moves both — which is what keeps rollback from
-# producing an old image against a new chart.
+# repo. For a tagged release, `v<version>` is simultaneously the chart reference
+# and the image tag — one string moves both, which is what keeps rollback from
+# producing an old image against a new chart. The tag must therefore never be
+# moved once pushed: a moved tag silently changes the chart under a version that
+# is already deployed, with no commit anywhere to show it. In production this is
+# why the chart is a published OCI artifact (as tenant-api already does) rather
+# than a git ref: a registry digest cannot be rewritten, a git tag can.
 #
-# The tag must therefore never be moved once pushed. A moved tag silently changes
-# the chart under a version that is already deployed, with no commit anywhere to
-# show it. In production this is why the chart is a published OCI artifact (as
-# tenant-api already does) rather than a git ref: a registry digest cannot be
-# rewritten, a git tag can.
+# dev/<tenant-id>/<whatever> is different ON PURPOSE: chart ref = the BRANCH NAME
+# (not a commit), image tag = whatever this push built. Two independent strings,
+# because they answer two different questions — "which chart" tracks the branch
+# continuously via ArgoCD's own polling, "which image" is this exact push. A
+# chart-only change (no app code touched) needs no dispatch at all; only the image
+# tag needs updating per push, and only `image` changes across pushes to the same
+# branch — `branch` is written once.
 #
 # Requires, on this repo:
 #   variable DOCKERHUB_NAMESPACE  (your Docker Hub user/org — not secret, it is
@@ -27,22 +33,15 @@ name: CI
 #                                  only — dispatches the dev-branch deploy below)
 #
 # The image tag is baked into the chart's values.yaml before packaging, so a
-# deployment pins the CHART version and gets a coherent chart+image. Nothing
-# downstream ever sets image.tag — that is what makes promotion "move the same
-# string to the next environment" and rollback "move it back".
+# release pins the CHART version and gets a coherent chart+image.
 #
 #   tag v1.2.3    -> image 1.2.3, chart read from git tag v1.2.3       (releasable)
-#   dev/<id>/*    -> image = full commit SHA = chart ref, SAME string — see below
+#   dev/<id>/*    -> image <slug>-<sha8>, chart ref = the branch itself
 #   main          -> image main-<sha8>, chart read from that commit
 #
 # dev/<tenant-id>/<whatever> is the whole self-service dev loop: create the tenant
 # ONCE with tenant-create.yml, then every push here updates ONLY this component of
-# that tenant. Nobody runs a workflow by hand again. The image tag on a dev branch
-# is the raw commit SHA rather than the usual <slug>-<sha8> — deliberately: it must
-# be the exact same string as the chart ref (git can't clone --branch a bare SHA,
-# but it CAN fetch one directly, which is what platform-workflows' preflight does),
-# or we reintroduce the two-strings-for-one-artifact problem this design removed
-# everywhere else. The Docker Hub tag reads worse; that's the trade.
+# that tenant. Nobody runs a workflow by hand again.
 
 on:
   push:
@@ -76,9 +75,11 @@ jobs:
             IMAGE_TAG="${GITHUB_REF_NAME#v}"
             CHART_REF="${GITHUB_REF_NAME}"
           elif [[ "${GITHUB_REF_NAME}" == dev/*/* ]]; then
-            # One string for both, always — see the header note on why.
-            IMAGE_TAG="${GITHUB_SHA}"
-            CHART_REF="${GITHUB_SHA}"
+            # chart ref = the branch itself, so ArgoCD tracks its HEAD on its own —
+            # a chart-only change needs no dispatch. image is just this push.
+            SLUG="${GITHUB_REF_NAME//\//-}"
+            IMAGE_TAG="${SLUG}-${SHA8}"
+            CHART_REF="${GITHUB_REF_NAME}"
           else
             SLUG="${GITHUB_REF_NAME//\//-}"
             IMAGE_TAG="${SLUG}-${SHA8}"
@@ -160,11 +161,12 @@ jobs:
             echo "::error::repository variable DEV_CLUSTER is not set."
             exit 1
           fi
-          gh workflow run tenant-component-version.yml -R kanzalqalandri/platform-workflows \
+          gh workflow run tenant-component-version.yml -R kanzalqalandri/platform-workflows --ref main \
             -f instance="${{ steps.dev.outputs.tenant }}" \
             -f cluster="${{ vars.DEV_CLUSTER }}" \
             -f component="${COMPONENT}" \
-            -f version="${{ steps.id.outputs.image_tag }}"
+            -f branch="${{ github.ref_name }}" \
+            -f image="${{ steps.id.outputs.image_tag }}"
 
       - name: Summary
         run: |
